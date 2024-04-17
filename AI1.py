@@ -1,17 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import spacy
 from torch.utils.data import DataLoader, TensorDataset
 import math
 import json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('data3.json', 'r', encoding='utf-8', errors='ignore') as file:
+nlp = spacy.load("en_core_web_lg")
+
+with open('BotsQ&A.json', 'r', encoding='utf-8', errors='ignore') as file:
     data = json.load(file)
 
 questions = [entry['question'] for entry in data]
 answers = [entry['answer'] for entry in data]
+
+questions = [token.text for question in questions for token in nlp(question)]
+answers = [token.text for answer in answers for token in nlp(answer)]
 
 word_to_idx = {}
 idx_to_word = {}
@@ -86,7 +92,7 @@ class DynamicActivationLayer(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super(CausalSelfAttention, self).__init__()
-        assert d_model % num_heads == 0, f"d_model deve ser divisível por num_heads. d_model: {d_model}, num_heads: {num_heads}"
+        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
@@ -117,60 +123,118 @@ class CausalSelfAttention(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.1):
         super(MultiHeadAttention, self).__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
+        assert d_model % nhead == 0
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.fc_out = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.fc_out = nn.Linear(d_model * nhead, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
+            nn.Linear(d_model, d_model * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, d_model)
+            nn.Linear(d_model * 2, d_model)
         )
-
+        
     def forward(self, query, key, value, mask=None):
-        query = self.dropout(query)
-        key = self.dropout(key)
-        value = self.dropout(value)
-        attn_output, _ = self.multihead_attn(query, key, value, attn_mask=mask)
-        attn_output = self.layer_norm(query + attn_output)
-        output = self.ffn(attn_output)
-        return self.fc_out(output)
+        batch_size = query.size(0)
+        query = self.query(query).view(batch_size, -1, self.nhead, self.head_dim).transpose(1, 2)
+        key = self.key(key).view(batch_size, -1, self.nhead, self.head_dim).transpose(1, 2)
+        value = self.value(value).view(batch_size, -1, self.nhead, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attention_probs = nn.functional.softmax(scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        context = torch.matmul(attention_probs, value)
+        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        output = self.fc_out(context)
+        output = self.layer_norm(query + output)
+        output = self.ffn(output)
+        return output
+    
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
         super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.position_embeddings = nn.Embedding(max_len, d_model)
         self.register_buffer('pe', pe)
-        self.fc1 = nn.Linear(d_model, d_model * 2)
-        self.fc2 = nn.Linear(d_model * 2, d_model)
-
+        self.layer_norm = nn.LayerNorm(d_model)
+        
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        x = nn.functional.relu(self.fc1(x))
-        x = self.fc2(x)
+        seq_length = x.size(1)
+        positions = torch.arange(0, seq_length, dtype=torch.long, device=x.device)
+        position_embeddings = self.position_embeddings(positions)
+        position_embeddings = position_embeddings.unsqueeze(0).expand_as(x)
+        x = x + self.pe[:seq_length] + position_embeddings
+        x = self.layer_norm(x)
+        x = self.dropout(x)
         return x
 
     
-class NormalizedFeedForward(nn.Module):
+class ResidualFeedForward(nn.Module):
     def __init__(self, d_model, hidden_dim, dropout=0.1):
-        super(NormalizedFeedForward, self).__init__()
+        super(ResidualFeedForward, self).__init__()
         self.dropout = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(d_model, hidden_dim * 2)
-        self.fc2 = nn.Linear(hidden_dim * 2, d_model * 2)
-        self.fc3 = nn.Linear(d_model * 2, d_model)
-        self.layer_norm = nn.LayerNorm(d_model)
-
+        self.fc1 = nn.Linear(d_model, hidden_dim * 4)
+        self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
+        self.fc3 = nn.Linear(hidden_dim * 2, d_model * 4)
+        self.fc4 = nn.Linear(d_model * 4, d_model)
+        self.layer_norm1 = nn.LayerNorm(hidden_dim * 4)
+        self.layer_norm2 = nn.LayerNorm(hidden_dim * 2)
+        self.layer_norm3 = nn.LayerNorm(d_model * 4)
+        self.layer_norm4 = nn.LayerNorm(d_model)
+        
     def forward(self, x):
+        residual = x
         x = self.dropout(x)
         x = nn.functional.relu(self.fc1(x))
+        x = self.layer_norm1(x)
         x = nn.functional.relu(self.fc2(x))
-        x = self.fc3(x)
-        x = self.layer_norm(x + x) 
+        x = self.layer_norm2(x)
+        x = nn.functional.relu(self.fc3(x))
+        x = self.layer_norm3(x)
+        x = self.fc4(x)
+        x = self.layer_norm4(x + residual)  
+        return x
+
+
+class MaskedLanguageModelHead(nn.Module):
+    def __init__(self, d_model, vocab_size, projection_dim=1024, dropout=0.1): 
+        super(MaskedLanguageModelHead, self).__init__()
+        self.layer_norm_before = nn.LayerNorm(d_model)  
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.LayerNorm(d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model * 4),
+            nn.LayerNorm(d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, projection_dim),
+            nn.LayerNorm(projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(projection_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU()
+        )
+        self.classifier = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        x = self.layer_norm_before(x)  
+        x = self.mlp(x)
+        x = self.classifier(x)
         return x
 
 
@@ -185,33 +249,36 @@ class AdvancedTransformer(nn.Module):
         decoder_layers = nn.TransformerDecoderLayer(d_model=embedding_dim, nhead=num_heads,
                                                     dim_feedforward=hidden_dim, dropout=dropout)
         self.decoder = nn.TransformerDecoder(decoder_layers, num_layers=num_layers)
-        self.dynamic_activation = DynamicActivationLayer(embedding_dim, num_heads, dropout) 
+        self.dynamic_activation = DynamicActivationLayer(embedding_dim, num_heads, dropout)
         self.causal_self_attention = CausalSelfAttention(embedding_dim, num_heads, dropout)
+        self.mlm_head = MaskedLanguageModelHead(embedding_dim, vocab_size)
         self.multihead_attention = MultiHeadAttention(embedding_dim, num_heads, dropout)
-        self.feed_forward = NormalizedFeedForward(embedding_dim, hidden_dim, dropout)
-        self.fc = nn.Linear(embedding_dim, vocab_size)
+        self.feed_forward1 = ResidualFeedForward(embedding_dim, hidden_dim, dropout)
+        self.feed_forward2 = ResidualFeedForward(embedding_dim, hidden_dim, dropout)
+        self.fc1 = nn.Linear(embedding_dim, embedding_dim * 2)
+        self.fc2 = nn.Linear(embedding_dim * 2, vocab_size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         embedded = self.embedding(x)
         embedded = self.positional_encoding(embedded)
         memory = self.encoder(embedded)
-
         queries = keys = values = self.dropout(embedded)
         dynamic_output = self.dynamic_activation(queries)
-
         causal_output = self.causal_self_attention(embedded)
         combined_output = dynamic_output + causal_output
         transformer_output = self.decoder(combined_output, memory)
-        feed_forward_output = self.feed_forward(transformer_output)
-        output = self.fc(feed_forward_output)
-        return output
+        feed_forward_output1 = self.feed_forward1(transformer_output)
+        feed_forward_output2 = self.feed_forward2(feed_forward_output1)
+        mlm_output = self.mlm_head(feed_forward_output2)
+        return mlm_output
+
     
 vocab_size = len(word_to_idx)
-embedding_dim = 12*100
-hidden_dim = 1024*16
-num_layers = 4*10
-num_heads = 4*10 
+embedding_dim = 10
+hidden_dim = 1
+num_layers = 2
+num_heads = 2
 model = AdvancedTransformer(vocab_size, embedding_dim, hidden_dim, num_layers, num_heads).to(device)
 
 criterion = nn.CrossEntropyLoss()
@@ -278,21 +345,23 @@ def generate_text_with_transformer(question, model, word_to_idx, idx_to_word, ma
 
         output_indices = []
         for _ in range(max_length):
-            output = model(input_tensor)
+            mask = (input_tensor != 0)
+            output = model(input_tensor, mask=mask)
             output_probs = nn.functional.softmax(output[:, -1, :], dim=-1)
             output_probs = output_probs.to('cpu')
             output_probs = output_probs ** (1 / temperature)
             output_probs = output_probs / torch.sum(output_probs)
             predicted_index = torch.multinomial(output_probs, num_samples=1)
 
-            if predicted_index == word_to_idx['<eos>']:
+            if predicted_index.item() == word_to_idx['<eos>']:
                 break
 
             output_indices.append(predicted_index.item())
-            input_tensor = torch.tensor([[predicted_index.item()]], dtype=torch.long).to(device)
+            input_tensor = torch.cat([input_tensor, torch.tensor([[predicted_index.item()]], dtype=torch.long).to(device)], dim=1)
 
         generated_text = ' '.join([idx_to_word[idx] for idx in output_indices])
         return generated_text
+
 
 while True:
     user_question = input("Ask me something (or 'exit' to quit): ")
@@ -300,5 +369,5 @@ while True:
         print("Goodbye!")
         break
 
-    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.7)
+    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.2)
     print(f'AI: {generated_answer}')
