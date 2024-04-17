@@ -7,7 +7,7 @@ import json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-with open('BotsQ&A.json', 'r', encoding='utf-8', errors='ignore') as file:
+with open('data3.json', 'r', encoding='utf-8', errors='ignore') as file:
     data = json.load(file)
 
 questions = [entry['question'] for entry in data]
