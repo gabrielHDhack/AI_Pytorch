@@ -62,6 +62,61 @@ dataset = TensorDataset(X_tensor, y_tensor)
 dataloader = DataLoader(dataset, batch_size=512, shuffle=True)
 
 
+class Lamb(optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6, weight_decay=0, adam=False):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, adam=adam)
+        super(Lamb, self).__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Lamb does not support sparse gradients')
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                state['step'] += 1
+
+                # Compute the biases corrected beta values
+                beta1_correction = 1 - beta1 ** state['step']
+                beta2_correction = 1 - beta2 ** state['step']
+
+                # Compute the adaptive learning rate
+                lr = group['lr'] * torch.sqrt(torch.tensor(beta2_correction)) / torch.tensor(beta1_correction)
+
+
+                # Compute the gradient averages
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Compute the weight decay
+                if group['weight_decay'] != 0:
+                    grad.add_(p.data, alpha=group['weight_decay'])
+
+                # Compute the root mean squared update
+                denom = exp_avg_sq.sqrt().add_(group['eps'])
+                step_size = lr
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+    
+
 class DynamicActivationLayer(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super(DynamicActivationLayer, self).__init__()
@@ -334,7 +389,7 @@ class LocalAttention(nn.Module):
 
 
 class SparseAttention(nn.Module):
-    def __init__(self, d_model, num_heads, sparsity=4, dropout=0.1):
+    def __init__(self, d_model, num_heads, sparsity=4, dropout=0.1, max_seq_len=1024):
         super(SparseAttention, self).__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -347,6 +402,17 @@ class SparseAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.sparsity = sparsity
         
+        # Precompute sparse mask
+        self.register_buffer('sparse_mask', self._generate_sparse_mask(max_seq_len))
+        
+    def _generate_sparse_mask(self, seq_len):
+        mask = torch.zeros(seq_len, seq_len)
+        for i in range(seq_len):
+            start = max(0, i - self.sparsity // 2)
+            end = min(seq_len, i + self.sparsity // 2 + 1)
+            mask[i, start:end] = 1
+        return mask.unsqueeze(0).unsqueeze(0)
+        
     def forward(self, x):
         batch_size, seq_len, d_model = x.size()
         query = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -355,13 +421,7 @@ class SparseAttention(nn.Module):
         
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
-        sparse_mask = torch.zeros(seq_len, seq_len, device=x.device)
-        for i in range(seq_len):
-            start = max(0, i - self.sparsity // 2)
-            end = min(seq_len, i + self.sparsity // 2 + 1)
-            sparse_mask[i, start:end] = 1
-        
-        scores = scores.masked_fill(sparse_mask == 0, float('-inf'))
+        scores = scores.masked_fill(self.sparse_mask[:, :, :seq_len, :seq_len] == 0, float('-inf'))
         
         attention_probs = nn.functional.softmax(scores, dim=-1)
         attention_probs = self.dropout(attention_probs)
@@ -370,6 +430,7 @@ class SparseAttention(nn.Module):
         output = self.fc_out(output)
         output = self.layer_norm(x + output)
         return output
+
 
 
 class KernelAttention(nn.Module):
@@ -458,16 +519,15 @@ class AdvancedTransformer(nn.Module):
     def forward(self, x, mask=None):
         embedded = self.embedding(x)
         embedded = self.positional_encoding(embedded)
-        embedded = embedded.permute(0, 2, 1)  
-        encoder_output = embedded
+        encoder_output = embedded.permute(0, 2, 1)  
         for layer in self.encoder_layers:
             encoder_output = F.relu(layer(encoder_output))
-        encoder_output = encoder_output.permute(0, 2, 1)  
+        encoder_output = encoder_output.permute(0, 2, 1)
         memory = self.encoder(encoder_output)
-        decoder_output = embedded
+        decoder_output = embedded.permute(0, 2, 1)
         for layer in self.decoder_layers:
             decoder_output = F.relu(layer(decoder_output))
-        decoder_output = decoder_output.permute(0, 2, 1)  
+        decoder_output = decoder_output.permute(0, 2, 1)
         queries = keys = values = self.dropout(decoder_output)
         dynamic_output = self.dynamic_activation(queries)
         causal_output = self.causal_self_attention(decoder_output)
@@ -483,16 +543,17 @@ class AdvancedTransformer(nn.Module):
         return mlm_output
 
 
-    
+
+
 vocab_size = len(word_to_idx)
-embedding_dim = 960 
-hidden_dim = 1024*16 
-num_layers = 96 
+embedding_dim = 960
+hidden_dim = 1024*16
+num_layers = 96
 num_heads = 48
 model = AdvancedTransformer(vocab_size, embedding_dim, hidden_dim, num_layers, num_heads).to(device)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=5e-6)
+optimizer = Lamb(model.parameters(), lr=5e-6)
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -547,28 +608,58 @@ for epoch in range(num_epochs):
 
 #torch.save(model.state_dict(), 'advanced_transformer_model.pth')
 
-def generate_text_with_transformer(question, model, word_to_idx, idx_to_word, max_length=10, temperature=0.7):
+def generate_text_with_combined_approach(question, model, word_to_idx, idx_to_word, max_length=10, temperature=0.7, top_k=0, top_p=0.9, beam_width=5, length_penalty=1.0, repetition_penalty=1.0):
     with torch.no_grad():
         question_indices = [word_to_idx[word] for word in question.split() if word in word_to_idx]
         padded_question = question_indices + [word_to_idx['<eos>']] + [0] * (max_length - len(question_indices) - 1)
         input_tensor = torch.tensor([padded_question], dtype=torch.long).to(device)
 
         output_indices = []
+        beam = [(input_tensor, 0)]
+        
         for _ in range(max_length):
-            mask = (input_tensor != 0)
-            output = model(input_tensor, mask=mask)
-            output_probs = nn.functional.softmax(output[:, -1, :], dim=-1)
-            output_probs = output_probs.to('cpu')
-            output_probs = output_probs ** (1 / temperature)
-            output_probs = output_probs / torch.sum(output_probs)
-            predicted_index = torch.multinomial(output_probs, num_samples=1)
-
-            if predicted_index.item() == word_to_idx['<eos>']: 
+            new_beam = []
+            
+            for (input_seq, score) in beam:
+                mask = (input_seq != 0)
+                output = model(input_seq, mask=mask)
+                output_probs = F.softmax(output[:, -1, :] / temperature, dim=-1).squeeze(0)
+                
+                if top_k > 0:
+                    sorted_probs, sorted_indices = torch.sort(output_probs, descending=True)
+                    sorted_probs = sorted_probs[:top_k]
+                    sorted_indices = sorted_indices[:top_k]
+                    sorted_probs /= sorted_probs.sum()
+                    
+                    sampled_indices = torch.multinomial(sorted_probs, 1)
+                    sampled_index = sorted_indices[sampled_indices].item()
+                elif top_p > 0:
+                    sorted_probs, sorted_indices = torch.sort(output_probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_probs[sorted_indices_to_remove] = 0
+                    sorted_probs /= sorted_probs.sum()
+                    
+                    sampled_indices = torch.multinomial(sorted_probs, 1)
+                    sampled_index = sorted_indices[sampled_indices].item()
+                else:
+                    sampled_index = torch.argmax(output_probs).item()
+                
+                if sampled_index == word_to_idx['<eos>']:
+                    new_beam.append((input_seq, score + length_penalty * (1 / (len(output_indices) + 1))))
+                elif sampled_index in [idx.item() for idx in input_seq[0]]:
+                    new_beam.append((input_seq, score * repetition_penalty))
+                else:
+                    new_input_seq = torch.cat([input_seq, torch.tensor([[sampled_index]], dtype=torch.long).to(device)], dim=1)
+                    new_beam.append((new_input_seq, score + output_probs[sampled_index].item()))
+            
+            beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:beam_width]
+            
+            output_indices = [idx.item() for idx in beam[0][0][0] if idx.item() != word_to_idx['<eos>']]
+            
+            if beam[0][0][0][-1].item() == word_to_idx['<eos>']:
                 break
-
-            output_indices.append(predicted_index.item())
-            input_tensor = torch.cat([input_tensor, torch.tensor([[predicted_index.item()]], dtype=torch.long).to(device)], dim=1)
-
+        
         generated_text = ' '.join([idx_to_word[idx] for idx in output_indices])
         return generated_text
 
@@ -579,5 +670,17 @@ while True:
         print("Goodbye!")
         break
 
-    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.7)
+    generated_answer = generate_text_with_combined_approach(
+    user_question,
+    model,
+    word_to_idx,
+    idx_to_word,
+    max_length=10,
+    temperature=0.7,
+    top_k=0,
+    top_p=0.9,
+    beam_width=5,
+    length_penalty=1.0,
+    repetition_penalty=1.0
+)
     print(f'AI: {generated_answer}')
