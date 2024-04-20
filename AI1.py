@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import spacy
 from torch.utils.data import DataLoader, TensorDataset
 import math
@@ -332,25 +333,124 @@ class LocalAttention(nn.Module):
         return output
 
 
+class SparseAttention(nn.Module):
+    def __init__(self, d_model, num_heads, sparsity=4, dropout=0.1):
+        super(SparseAttention, self).__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.fc_out = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.sparsity = sparsity
+        
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.size()
+        query = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        sparse_mask = torch.zeros(seq_len, seq_len, device=x.device)
+        for i in range(seq_len):
+            start = max(0, i - self.sparsity // 2)
+            end = min(seq_len, i + self.sparsity // 2 + 1)
+            sparse_mask[i, start:end] = 1
+        
+        scores = scores.masked_fill(sparse_mask == 0, float('-inf'))
+        
+        attention_probs = nn.functional.softmax(scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        output = torch.matmul(attention_probs, value)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        output = self.fc_out(output)
+        output = self.layer_norm(x + output)
+        return output
+
+
+class KernelAttention(nn.Module):
+    def __init__(self, d_model, kernel_size=3, num_layers=90, dropout=0.1):
+        super(KernelAttention, self).__init__()
+        self.layers = nn.ModuleList([
+            nn.Conv1d(d_model, d_model, kernel_size, padding=kernel_size // 2)
+            for _ in range(num_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        residual = x
+        for layer in self.layers:
+            x = F.relu(layer(x.transpose(1, 2)).transpose(1, 2))
+            x = self.dropout(x)
+        
+        output = self.layer_norm(residual + x)
+        return output
+
+
+
+class ReformerAttention(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super(ReformerAttention, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.fc_out = nn.Linear(d_model, d_model)
+        
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.size()
+        query = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attention_probs = nn.functional.softmax(scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        output = torch.matmul(attention_probs, value)
+        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
+        output = self.fc_out(output)
+        return output
+
+
 class AdvancedTransformer(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers, num_heads, dropout=0.1):
         super(AdvancedTransformer, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.positional_encoding = PositionalEncoding(embedding_dim)
-        encoder_layers = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=num_heads,
-                                                    dim_feedforward=hidden_dim, dropout=dropout)
-        self.encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        decoder_layers = nn.TransformerDecoderLayer(d_model=embedding_dim, nhead=num_heads,
-                                                    dim_feedforward=hidden_dim, dropout=dropout)
-        self.decoder = nn.TransformerDecoder(decoder_layers, num_layers=num_layers)
+        self.encoder_layers = nn.ModuleList([
+            nn.Conv1d(embedding_dim, hidden_dim * 4, kernel_size=3, padding=1, dilation=1)
+            for _ in range(num_layers)
+        ])
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(embedding_dim, num_heads, hidden_dim, dropout),
+            num_layers=num_layers
+        )
+        self.decoder_layers = nn.ModuleList([
+            nn.Conv1d(embedding_dim, hidden_dim * 4, kernel_size=3, padding=1, dilation=1)
+            for _ in range(num_layers)
+        ])
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(embedding_dim, num_heads, hidden_dim, dropout),
+            num_layers=num_layers
+        )
         self.dynamic_activation = DynamicActivationLayer(embedding_dim, num_heads, dropout)
         self.causal_self_attention = CausalSelfAttention(embedding_dim, num_heads, dropout)
         self.axial_attention = AxialAttention(embedding_dim, num_heads, dropout)
         self.local_attention = LocalAttention(embedding_dim, window_size=3, num_heads=num_heads, dropout=dropout)
+        self.kernel_attention = KernelAttention(embedding_dim, num_layers=3, dropout=dropout)
         self.mlm_head = MaskedLanguageModelHead(embedding_dim, vocab_size)
         self.multihead_attention = MultiHeadAttention(embedding_dim, num_heads, dropout)
         self.feed_forward1 = ResidualFeedForward(embedding_dim, hidden_dim, dropout)
         self.feed_forward2 = ResidualFeedForward(embedding_dim, hidden_dim, dropout)
+        self.sparse_attention = SparseAttention(embedding_dim, num_heads, sparsity=4, dropout=dropout)
+        self.reformer_attention = ReformerAttention(embedding_dim, num_heads, dropout)
+        self.layer_norm = nn.LayerNorm(embedding_dim)
         self.fc1 = nn.Linear(embedding_dim, embedding_dim * 2)
         self.fc2 = nn.Linear(embedding_dim * 2, vocab_size)
         self.dropout = nn.Dropout(dropout)
@@ -358,18 +458,31 @@ class AdvancedTransformer(nn.Module):
     def forward(self, x, mask=None):
         embedded = self.embedding(x)
         embedded = self.positional_encoding(embedded)
-        memory = self.encoder(embedded)
-        queries = keys = values = self.dropout(embedded)
+        embedded = embedded.permute(0, 2, 1)  
+        encoder_output = embedded
+        for layer in self.encoder_layers:
+            encoder_output = F.relu(layer(encoder_output))
+        encoder_output = encoder_output.permute(0, 2, 1)  
+        memory = self.encoder(encoder_output)
+        decoder_output = embedded
+        for layer in self.decoder_layers:
+            decoder_output = F.relu(layer(decoder_output))
+        decoder_output = decoder_output.permute(0, 2, 1)  
+        queries = keys = values = self.dropout(decoder_output)
         dynamic_output = self.dynamic_activation(queries)
-        causal_output = self.causal_self_attention(embedded)
-        axial_output = self.axial_attention(embedded)
-        local_output = self.local_attention(embedded)
-        combined_output = dynamic_output + causal_output + axial_output + local_output
-        transformer_output = self.decoder(combined_output, memory)
+        causal_output = self.causal_self_attention(decoder_output)
+        axial_output = self.axial_attention(decoder_output)
+        local_output = self.local_attention(decoder_output)
+        kernel_output = self.kernel_attention(decoder_output)
+        combined_output = dynamic_output + causal_output + axial_output + local_output + kernel_output
+        sparse_output = self.sparse_attention(combined_output)
+        transformer_output = self.decoder(sparse_output, memory)
         feed_forward_output1 = self.feed_forward1(transformer_output)
         feed_forward_output2 = self.feed_forward2(feed_forward_output1)
         mlm_output = self.mlm_head(feed_forward_output2)
         return mlm_output
+
+
     
 vocab_size = len(word_to_idx)
 embedding_dim = 960 
@@ -404,7 +517,7 @@ def evaluate_model(model, dataloader, criterion):
 
     return average_loss, perplexity
 
-num_epochs = 100
+num_epochs = 10
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
@@ -434,7 +547,7 @@ for epoch in range(num_epochs):
 
 #torch.save(model.state_dict(), 'advanced_transformer_model.pth')
 
-def generate_text_with_transformer(question, model, word_to_idx, idx_to_word, max_length=50, temperature=0.2):
+def generate_text_with_transformer(question, model, word_to_idx, idx_to_word, max_length=10, temperature=0.7):
     with torch.no_grad():
         question_indices = [word_to_idx[word] for word in question.split() if word in word_to_idx]
         padded_question = question_indices + [word_to_idx['<eos>']] + [0] * (max_length - len(question_indices) - 1)
@@ -466,5 +579,5 @@ while True:
         print("Goodbye!")
         break
 
-    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.2)
+    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.7)
     print(f'AI: {generated_answer}')
