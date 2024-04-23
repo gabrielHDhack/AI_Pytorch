@@ -82,7 +82,6 @@ class Lamb(optim.Optimizer):
 
                 state = self.state[p]
 
-                # State initialization
                 if len(state) == 0:
                     state['step'] = 0
                     state['exp_avg'] = torch.zeros_like(p.data)
@@ -90,26 +89,16 @@ class Lamb(optim.Optimizer):
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 beta1, beta2 = group['betas']
-
                 state['step'] += 1
-
-                # Compute the biases corrected beta values
                 beta1_correction = 1 - beta1 ** state['step']
                 beta2_correction = 1 - beta2 ** state['step']
 
-                # Compute the adaptive learning rate
                 lr = group['lr'] * torch.sqrt(torch.tensor(beta2_correction)) / torch.tensor(beta1_correction)
-
-
-                # Compute the gradient averages
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Compute the weight decay
                 if group['weight_decay'] != 0:
                     grad.add_(p.data, alpha=group['weight_decay'])
-
-                # Compute the root mean squared update
                 denom = exp_avg_sq.sqrt().add_(group['eps'])
                 step_size = lr
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
@@ -543,6 +532,8 @@ class AdvancedTransformer(nn.Module):
         return mlm_output
 
 
+
+
 vocab_size = len(word_to_idx)
 embedding_dim = 960
 hidden_dim = 1024*16
@@ -576,7 +567,7 @@ def evaluate_model(model, dataloader, criterion):
 
     return average_loss, perplexity
 
-num_epochs = 10
+num_epochs = 100
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
@@ -606,58 +597,28 @@ for epoch in range(num_epochs):
 
 #torch.save(model.state_dict(), 'advanced_transformer_model.pth')
 
-def generate_text_with_combined_approach(question, model, word_to_idx, idx_to_word, max_length=10, temperature=0.7, top_k=0, top_p=0.9, beam_width=5, length_penalty=1.0, repetition_penalty=1.0):
+def generate_text_with_transformer(question, model, word_to_idx, idx_to_word, max_length=10, temperature=0.7):
     with torch.no_grad():
         question_indices = [word_to_idx[word] for word in question.split() if word in word_to_idx]
         padded_question = question_indices + [word_to_idx['<eos>']] + [0] * (max_length - len(question_indices) - 1)
         input_tensor = torch.tensor([padded_question], dtype=torch.long).to(device)
 
         output_indices = []
-        beam = [(input_tensor, 0)]
-        
         for _ in range(max_length):
-            new_beam = []
-            
-            for (input_seq, score) in beam:
-                mask = (input_seq != 0)
-                output = model(input_seq, mask=mask)
-                output_probs = F.softmax(output[:, -1, :] / temperature, dim=-1).squeeze(0)
-                
-                if top_k > 0:
-                    sorted_probs, sorted_indices = torch.sort(output_probs, descending=True)
-                    sorted_probs = sorted_probs[:top_k]
-                    sorted_indices = sorted_indices[:top_k]
-                    sorted_probs /= sorted_probs.sum()
-                    
-                    sampled_indices = torch.multinomial(sorted_probs, 1)
-                    sampled_index = sorted_indices[sampled_indices].item()
-                elif top_p > 0:
-                    sorted_probs, sorted_indices = torch.sort(output_probs, descending=True)
-                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_probs[sorted_indices_to_remove] = 0
-                    sorted_probs /= sorted_probs.sum()
-                    
-                    sampled_indices = torch.multinomial(sorted_probs, 1)
-                    sampled_index = sorted_indices[sampled_indices].item()
-                else:
-                    sampled_index = torch.argmax(output_probs).item()
-                
-                if sampled_index == word_to_idx['<eos>']:
-                    new_beam.append((input_seq, score + length_penalty * (1 / (len(output_indices) + 1))))
-                elif sampled_index in [idx.item() for idx in input_seq[0]]:
-                    new_beam.append((input_seq, score * repetition_penalty))
-                else:
-                    new_input_seq = torch.cat([input_seq, torch.tensor([[sampled_index]], dtype=torch.long).to(device)], dim=1)
-                    new_beam.append((new_input_seq, score + output_probs[sampled_index].item()))
-            
-            beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:beam_width]
-            
-            output_indices = [idx.item() for idx in beam[0][0][0] if idx.item() != word_to_idx['<eos>']]
-            
-            if beam[0][0][0][-1].item() == word_to_idx['<eos>']:
+            mask = (input_tensor != 0)
+            output = model(input_tensor, mask=mask)
+            output_probs = nn.functional.softmax(output[:, -1, :], dim=-1)
+            output_probs = output_probs.to('cpu')
+            output_probs = output_probs ** (1 / temperature)
+            output_probs = output_probs / torch.sum(output_probs)
+            predicted_index = torch.multinomial(output_probs, num_samples=1)
+
+            if predicted_index.item() == word_to_idx['<eos>']: 
                 break
-        
+
+            output_indices.append(predicted_index.item())
+            input_tensor = torch.cat([input_tensor, torch.tensor([[predicted_index.item()]], dtype=torch.long).to(device)], dim=1)
+
         generated_text = ' '.join([idx_to_word[idx] for idx in output_indices])
         return generated_text
 
@@ -668,17 +629,5 @@ while True:
         print("Goodbye!")
         break
 
-    generated_answer = generate_text_with_combined_approach(
-    user_question,
-    model,
-    word_to_idx,
-    idx_to_word,
-    max_length=10,
-    temperature=0.7,
-    top_k=0,
-    top_p=0.9,
-    beam_width=5,
-    length_penalty=1.0,
-    repetition_penalty=1.0
-)
+    generated_answer = generate_text_with_transformer(user_question, model, word_to_idx, idx_to_word, temperature=0.7)
     print(f'AI: {generated_answer}')
